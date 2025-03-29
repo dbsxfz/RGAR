@@ -63,6 +63,39 @@ This project employs the MedCPT retriever for information retrieval tasks. MedCP
 
 Please follow the requirements.txt to install necessary packages.
 
-## Usage
+## Usage  
 
-will be updated before 3.10.
+### Project Structure  
+Before running the model, you should obtain the required models and corpus. The models should be placed in Hugging Face’s default directory, while the corpus should be organized as follows. Due to copyright restrictions, **EHRNoteQA** is not included in `benchmark.json`.  
+
+```text
+RGAR/
+├── corpus/               
+│   ├── textbooks/    # Collection of textbooks for retrieval tasks
+│   ├── ...                  
+├── log/              # Logs for tracking experiments and debugging
+├── results/          # Output results and evaluation metrics
+├── src/              # Source code implementation
+├── benchmark.json    # Benchmark settings for evaluation
+├── requirements.txt  # Required dependencies
+├── README.md         # Project documentation
+├── demo.ipynb        # Example usage and function demonstration
+└── ...       
+```
+
+### Running the Model  
+Example shell scripts for running the model are provided in the `shell/` directory. Before execution, move the required script to the root directory. Detailed function usage is demonstrated in `demo.ipynb`.  
+
+## Tips  
+
+To ensure reproducibility, all experiments are conducted with `temperature=0`. Additional key parameter settings include:  
+- **Precision**: We use `torch.bfloat16` for efficient computation.  
+- **Token Generation**: To mitigate repetitive generation issues in small LLMs, we set `max_new_tokens=4096` and `repetition_penalty=1.2`.  
+- **Answer Extraction**: To support EHRNoteQA with five options (and potential future cases with more options), answers are extracted using regex-based methods implemented in the `extract_answer` function within `pipeline.py`.  
+
+## Acknowledgment
+
+This project is based on modifications of the original **MedRAG** code. We have explicitly marked the corresponding Python files where modifications were made. We sincerely appreciate the efforts of the open-source community and the existing work that made this project possible.
+
+
+
