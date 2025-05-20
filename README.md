@@ -1,7 +1,5 @@
 # FAR-GOING
-Code for Paper FAR-GOING: Fact-Aware Recurrence Generation-Augmented Retrieval for Medical Question Answering.
-
-The model is also known as RGAR.
+Code for Paper RGAR: Recurrence Generation-augmented Retrieval for Factual-aware Medical Question Answering.
 
 ## Table of Contents
 
