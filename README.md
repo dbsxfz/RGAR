@@ -1,5 +1,5 @@
 # RGAR
-Code for Paper RGAR: Recurrence Generation-augmented Retrieval for Factual-aware Medical Question Answering submitted to ACL 2025.
+Code for Paper FAR-GOING: Fact-Aware Recurrence Generation-Augmented Retrieval for Medical Question Answering.
 
 ## Table of Contents
 
