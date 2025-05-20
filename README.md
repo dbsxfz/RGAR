@@ -1,4 +1,4 @@
-# FAR-GOING
+# RGAR
 Code for Paper RGAR: Recurrence Generation-augmented Retrieval for Factual-aware Medical Question Answering.
 
 ## Table of Contents
