@@ -1,5 +1,5 @@
 # RGAR
-Code for Paper RGAR: Recurrence Generation-augmented Retrieval for Factual-aware Medical Question Answering.
+Code for Paper RGAR: Recurrence Generation-augmented Retrieval for Factual-aware Medical Question Answering accepted by EMNLP 2025 findings.
 
 ## Table of Contents
 
