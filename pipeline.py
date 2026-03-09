@@ -2,15 +2,18 @@ import argparse
 import json
 import os
 import re
-import torch
-# from MIRAGE.src.utils import QADataset
-# from src.medrag import MedRAG
-from src.RGAR import RGAR
+
+
+RETRIEVAL_MODES = ("direct", "gar", "rgar", "iterative_rgar")
+DEFAULT_RETRIEVAL_MODE = "direct"
+
+
 class QADataset:
 
     def __init__(self, data, dir="."):
         self.data = data.lower().split("_")[0]
-        benchmark = json.load(open(os.path.join(dir, "benchmark.json")))
+        with open(os.path.join(dir, "benchmark.json"), "r", encoding="utf-8") as f:
+            benchmark = json.load(f)
         if self.data not in benchmark:
             raise KeyError("{:s} not supported".format(data))
         self.dataset = benchmark[self.data]
@@ -26,6 +29,8 @@ class QADataset:
             return [self.__getitem__(i) for i in range(self.__len__())[key]]
         else:
             raise KeyError("Key type not supported.")
+
+
 def extract_answer(content):
     
     match = re.findall(r'(?:answer|Answer).*?([A-Z])', content)
@@ -38,18 +43,23 @@ def extract_answer(content):
     return None
 
 def main(args):
+    import torch
+    from src.RGAR import RGAR
+
     dataset = QADataset(args.dataset_name, dir=args.dataset_dir)
 
     rgar = RGAR(
         llm_name=args.llm_name, 
         rag=args.rag, 
+        follow_up=args.follow_up,
         retriever_name=args.retriever_name, 
         corpus_name=args.corpus_name, 
         device=args.device,
         cot=args.cot,
-        me=args.me,
-        follow_up=args.follow_up,
-        realme=args.realme
+        retrieval_mode=args.retrieval_mode,
+        iterative_rounds=args.iterative_rounds,
+        follow_up_rounds=args.follow_up_rounds,
+        follow_up_queries=args.follow_up_queries,
     )
 
     if os.path.exists(args.output_path):
@@ -101,7 +111,7 @@ def main(args):
 
         torch.cuda.empty_cache()
 
-    accuracy = correct_count / len(dataset)
+    accuracy = correct_count / len(dataset) if len(dataset) > 0 else 0.0
     print(f"\nAccuracy: {accuracy * 100:.2f}%")
     torch.cuda.empty_cache()
     with open(args.output_path, "w", encoding="utf-8") as f:
@@ -120,9 +130,17 @@ if __name__ == "__main__":
     parser.add_argument("--corpus_name", type=str, default="Textbooks", help="Name of the corpus to use.")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the model on.")
     parser.add_argument("--cot", action="store_true", help="Enable Chain-of-Thought reasoning.")
-    parser.add_argument('--me', type=int, default=0, help='Enable ME mode with specified level (default: 0)')
+    parser.add_argument(
+        "--retrieval_mode",
+        type=str,
+        choices=RETRIEVAL_MODES,
+        default=DEFAULT_RETRIEVAL_MODE,
+        help="Retrieval mode: direct | gar | rgar | iterative_rgar.",
+    )
+    parser.add_argument("--iterative_rounds", type=int, default=2, help="Number of rounds for iterative_rgar mode.")
+    parser.add_argument("--follow_up", action="store_true", help="Enable i-medrag follow-up ask/answer loop.")
+    parser.add_argument("--follow_up_rounds", type=int, default=2, help="Number of follow-up rounds in i-medrag mode.")
+    parser.add_argument("--follow_up_queries", type=int, default=3, help="Queries generated per follow-up round in i-medrag mode.")
     parser.add_argument("--top_k", type=int, default=32, help="Number of top results to retrieve.")
-    parser.add_argument("--follow_up", action="store_true", help="Enable follow-up question generation.")
-    parser.add_argument("--realme", action="store_true", help="Enable realme reasoning.")
     args = parser.parse_args()
     main(args)

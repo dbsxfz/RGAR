@@ -6,29 +6,55 @@
 import os
 import re
 import json
-import tqdm
+import ast
 import torch
-import time
-import argparse
 import transformers
 from transformers import AutoTokenizer
 import openai
 from transformers import StoppingCriteria, StoppingCriteriaList
 import tiktoken
-import sys
-sys.path.append("src")
-from utils import RetrievalSystem, DocExtracter
-from template import *
-
-from config import config
-
-import signal
-
-class TimeoutException(Exception):
-    pass
-
-def timeout_handler(signum, frame):
-    raise TimeoutException("Model generation timeout!")
+try:
+    from .utils import RetrievalSystem, DocExtracter
+    from .template import (
+        general_cot_system,
+        general_cot,
+        general_medrag_system,
+        general_medrag,
+        general_cot_system2,
+        general_cot2,
+        general_medrag_system2,
+        general_medrag2,
+        general_extract_nolist,
+        meditron_cot,
+        meditron_medrag,
+        simple_medrag_system,
+        simple_medrag_prompt,
+        i_medrag_system,
+        follow_up_instruction_ask,
+        follow_up_instruction_answer,
+    )
+    from .config import config
+except ImportError:
+    from utils import RetrievalSystem, DocExtracter
+    from template import (
+        general_cot_system,
+        general_cot,
+        general_medrag_system,
+        general_medrag,
+        general_cot_system2,
+        general_cot2,
+        general_medrag_system2,
+        general_medrag2,
+        general_extract_nolist,
+        meditron_cot,
+        meditron_medrag,
+        simple_medrag_system,
+        simple_medrag_prompt,
+        i_medrag_system,
+        follow_up_instruction_ask,
+        follow_up_instruction_answer,
+    )
+    from config import config
 
 
 
@@ -56,17 +82,50 @@ else:
         ).chat.completions.create(**x).choices[0].message.content
 
 class RGAR:
+    RETRIEVAL_MODE_DIRECT = "direct"
+    RETRIEVAL_MODE_GAR = "gar"
+    RETRIEVAL_MODE_RGAR = "rgar"
+    RETRIEVAL_MODE_ITERATIVE_RGAR = "iterative_rgar"
+    RETRIEVAL_MODE_NAMES = (
+        RETRIEVAL_MODE_DIRECT,
+        RETRIEVAL_MODE_GAR,
+        RETRIEVAL_MODE_RGAR,
+        RETRIEVAL_MODE_ITERATIVE_RGAR,
+    )
 
-    def __init__(self, llm_name="OpenAI/gpt-3.5-turbo-16k", rag=True, follow_up=False, retriever_name="MedCPT", corpus_name="Textbooks", db_dir="./corpus", cache_dir=None, corpus_cache=False, HNSW=False,device="auto",cot=False,me=0,realme=False):
+    def __init__(
+        self,
+        llm_name="OpenAI/gpt-3.5-turbo-16k",
+        rag=True,
+        follow_up=False,
+        retriever_name="MedCPT",
+        corpus_name="Textbooks",
+        db_dir="./corpus",
+        cache_dir=None,
+        corpus_cache=False,
+        HNSW=False,
+        device="auto",
+        cot=False,
+        retrieval_mode="direct",
+        iterative_rounds=2,
+        follow_up_rounds=2,
+        follow_up_queries=3,
+    ):
         self.llm_name = llm_name
         self.rag = rag
-        self.me =me
+        self.follow_up = bool(follow_up)
+        self.retrieval_mode = retrieval_mode
+        if self.retrieval_mode not in self.RETRIEVAL_MODE_NAMES:
+            valid_modes = ", ".join(self.RETRIEVAL_MODE_NAMES)
+            raise ValueError(f"Unsupported retrieval mode: {self.retrieval_mode}. Expected one of {valid_modes}.")
+        self.iterative_rounds = max(1, int(iterative_rounds))
+        self.follow_up_rounds = max(1, int(follow_up_rounds))
+        self.follow_up_queries = max(1, int(follow_up_queries))
         self.retriever_name = retriever_name
         self.corpus_name = corpus_name
         self.db_dir = db_dir
         self.cache_dir = cache_dir
         self.docExt = None
-        self.realme = realme
         if rag:
             self.retrieval_system = RetrievalSystem(self.retriever_name, self.corpus_name, self.db_dir, cache=corpus_cache, HNSW=HNSW)
         else:
@@ -145,26 +204,102 @@ class RGAR:
             )
             if "llama-3" in llm_name.lower():
                 self.tokenizer=self.model.tokenizer
-        
-        self.follow_up = follow_up
+
         if self.rag and self.follow_up:
-            self.answer = self.i_medrag_answer
             self.templates["medrag_system"] = simple_medrag_system
             self.templates["medrag_prompt"] = simple_medrag_prompt
             self.templates["i_medrag_system"] = i_medrag_system
             self.templates["follow_up_ask"] = follow_up_instruction_ask
             self.templates["follow_up_answer"] = follow_up_instruction_answer
-        else:
-            if self.realme:
-                self.answer = self.medrag_answer_realme
-            else:
-                self.answer = self.medrag_answer
+
+    def answer(self, *args, **kwargs):
+        if self.rag and self.follow_up:
+            return self.i_medrag_answer(*args, **kwargs)
+        return self.medrag_answer(*args, **kwargs)
+
+    @staticmethod
+    def _format_options(options):
+        if options is None:
+            return ""
+        if isinstance(options, dict):
+            return '\n'.join([key + ". " + options[key] for key in sorted(options.keys())])
+        return str(options)
+
+    @staticmethod
+    def _join_query_parts(*parts):
+        valid_parts = []
+        for part in parts:
+            if part is None:
+                continue
+            part_str = str(part).strip()
+            if part_str:
+                valid_parts.append(part_str)
+        return "\n".join(valid_parts)
+
+    @staticmethod
+    def _split_budget(total, parts):
+        if parts <= 0:
+            return []
+        base = total // parts
+        extra = total % parts
+        return [base + (1 if i < extra else 0) for i in range(parts)]
+
+    def _run_multi_query_retrieval(self, queries, budgets, rrf_k=100):
+        all_retrieved_snippets = []
+        all_scores = []
+        for query, budget in zip(queries, budgets):
+            if budget <= 0:
+                continue
+            cleaned_query = str(query).strip()
+            if not cleaned_query:
+                continue
+            retrieved_snippets, scores = self.retrieval_system.retrieve(cleaned_query, k=budget, rrf_k=rrf_k)
+            all_retrieved_snippets.extend(retrieved_snippets)
+            all_scores.extend(scores)
+        return all_retrieved_snippets, all_scores
+
+    def _build_contexts(self, retrieved_snippets):
+        contexts = [
+            "Document [{:d}] (Title: {:s}) {:s}".format(idx, retrieved_snippets[idx]["title"], retrieved_snippets[idx]["content"])
+            for idx in range(len(retrieved_snippets))
+        ]
+        if len(contexts) == 0:
+            return [""]
+        context_text = "\n".join(contexts)
+        if "openai" in self.llm_name.lower() or "gemini" in self.llm_name.lower():
+            return [self.tokenizer.decode(self.tokenizer.encode(context_text)[:self.context_length])]
+        return [self.tokenizer.decode(self.tokenizer.encode(context_text, add_special_tokens=False)[:self.context_length])]
+
+    @staticmethod
+    def _safe_parse_list(raw_text):
+        if raw_text is None:
+            return None
+        text = str(raw_text).strip()
+        if text == "":
+            return []
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+            except Exception:
+                continue
+            if isinstance(parsed, list):
+                return parsed
+        return None
+
+    def _select_retrieval_strategy(self):
+        strategies = {
+            self.RETRIEVAL_MODE_DIRECT: lambda question, options, k, rrf_k: self.retrieval_system.retrieve(question, k=k, rrf_k=rrf_k),
+            self.RETRIEVAL_MODE_GAR: self.retrieve_with_gar,
+            self.RETRIEVAL_MODE_RGAR: self.retrieve_with_rgar,
+            self.RETRIEVAL_MODE_ITERATIVE_RGAR: self.retrieve_with_iterative_rgar,
+        }
+        return strategies[self.retrieval_mode]
 
     def custom_stop(self, stop_str, input_len=0):
         stopping_criteria = StoppingCriteriaList([CustomStoppingCriteria(stop_str, self.tokenizer, input_len)])
         return stopping_criteria
 
-    def generate(self, messages):
+    def generate(self, messages, **kwargs):
         '''
         generate response given messages
         '''
@@ -260,18 +395,12 @@ class RGAR:
         answers = []
         answers.append(re.sub("\s+", " ", ans))
         answers = answers[0]
-
-        print(f"Generated Answer: {answers}")
         
         matched_items = re.findall(r'"([^"]*)"', answers)
 
         if matched_items:
-            print(f"number queries: {len(matched_items)}")
-            print(f"extract info: {matched_items}")
-
             return matched_items,answers
         else:
-            print("no info found")
             return [],answers
     def generate_possible_content(self,question):
 
@@ -335,138 +464,235 @@ class RGAR:
         
         return len(sentences), other_sentences, last_sentence
 
-    def retrieve_me_GAR_original_pro(self,question,options="",k=32,rrf_k=100):
+    def retrieve_with_rgar(self, question, options="", k=32, rrf_k=100):
+        """
+        RGAR retrieval:
+        1) Extract factual details from EHR/question text when available.
+        2) Use the facts to seed GAR-style query generation.
+        """
+        _, other_sentences, last_sentence = self.split_sentences(question)
+        factual_seed = ""
+        if other_sentences != "":
+            factual_items, factual_raw = self.extract_factual_info(question)
+            factual_seed = "; ".join(factual_items) if factual_items else factual_raw
 
-        num_sentences, other_sentences, last_sentence = self.split_sentences(question)
-        if other_sentences =="":
-            original_answers =""
-        else:
-            parsed_list,original_answers = self.extract_factual_info(question)
-        half_k = k // 2
-        quarter_k = k // 4
-        all_retrieved_snippets = []
-        all_scores = []
+        query_seed = self._join_query_parts(factual_seed, last_sentence) or question
+        option_text = self._format_options(options)
+        possible_answers = self.generate_possible_answer(query_seed)
+        possible_content = self.generate_possible_content(query_seed)
+        possible_title = self.generate_possible_title(query_seed)
 
-        options = '\n'.join([key+". "+options[key] for key in sorted(options.keys())])
-        possible_answers = self.generate_possible_answer(original_answers+last_sentence)
-        retrieved_snippets, scores = self.retrieval_system.retrieve(original_answers+last_sentence+possible_answers, k=half_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets)  
-        all_scores.extend(scores)  
-
-        possible_content = self.generate_possible_content(original_answers+last_sentence)
-        retrieved_snippets, scores = self.retrieval_system.retrieve(possible_content, k=quarter_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets)  
-        all_scores.extend(scores)
-  
-        possible_title = self.generate_possible_title(original_answers+last_sentence)
-        retrieved_snippets, scores = self.retrieval_system.retrieve(possible_title, k=quarter_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets)  
-        all_scores.extend(scores)
-        return all_retrieved_snippets,all_scores
+        queries = [
+            self._join_query_parts(query_seed, option_text, possible_answers),
+            self._join_query_parts(query_seed, possible_content),
+            self._join_query_parts(query_seed, possible_title),
+        ]
+        budgets = self._split_budget(k, len(queries))
+        return self._run_multi_query_retrieval(queries, budgets, rrf_k=rrf_k)
     
-    def retrieve_me_GAR_original(self,question,options="",k=32,rrf_k=100):
-
-        num_sentences, other_sentences, last_sentence = self.split_sentences(question)
-        half_k = k // 2
-        quarter_k = k // 4
-        all_retrieved_snippets = []
-        all_scores = []
-        retrieved_snippets, scores = self.retrieval_system.retrieve(last_sentence, k=quarter_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets) 
-        all_scores.extend(scores)  
-        
-        options = '\n'.join([key+". "+options[key] for key in sorted(options.keys())])
-        retrieved_snippets, scores = self.retrieval_system.retrieve(options, k=quarter_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets)  
-        all_scores.extend(scores)  
-
+    def retrieve_with_gar(self, question, options="", k=32, rrf_k=100):
+        """
+        GAR retrieval without explicit factual extraction.
+        """
+        _, _, last_sentence = self.split_sentences(question)
+        option_text = self._format_options(options)
         possible_content = self.generate_possible_content(question)
-        retrieved_snippets, scores = self.retrieval_system.retrieve(possible_content, k=quarter_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets)  
-        all_scores.extend(scores)
-
         possible_title = self.generate_possible_title(question)
-        retrieved_snippets, scores = self.retrieval_system.retrieve(possible_title, k=quarter_k, rrf_k=rrf_k)
-        all_retrieved_snippets.extend(retrieved_snippets)  
-        all_scores.extend(scores)
-        
-        return all_retrieved_snippets,all_scores
 
+        queries = [
+            last_sentence or question,
+            option_text,
+            possible_content,
+            possible_title,
+        ]
+        budgets = self._split_budget(k, len(queries))
+        return self._run_multi_query_retrieval(queries, budgets, rrf_k=rrf_k)
 
-    def medrag_answer_realme(self, question, options=None, k=32, rrf_k=100, save_dir = None, snippets=None, snippets_ids=None,num_rounds=2, **kwargs):
-        '''
-        question (str): question to be answered
-        options (Dict[str, str]): options to be chosen from
-        k (int): number of snippets to retrieve
-        rrf_k (int): parameter for Reciprocal Rank Fusion
-        save_dir (str): directory to save the results
-        snippets (List[Dict]): list of snippets to be used
-        snippets_ids (List[Dict]): list of snippet ids to be used
-        '''
-        copy_options = options
-        options = '\n'.join([key+". "+options[key] for key in sorted(options.keys())])
-        
+    def retrieve_with_iterative_rgar(self, question, options="", k=32, rrf_k=100):
+        """
+        Multi-round RGAR retrieval:
+        repeatedly extract facts from current retrieval results, then regenerate
+        retrieval queries for the next round.
+        """
+        option_text = self._format_options(options)
         retrieved_snippets, scores = self.retrieval_system.retrieve(question, k=k, rrf_k=rrf_k)
-        all_retrieved_snippets = retrieved_snippets
-        all_scores = scores
-        for i in range(num_rounds):
-            # extract factual information
-            num_sentences, other_sentences, last_sentence = self.split_sentences(question)
-            if other_sentences =="":
-                extract_sentences =""
-            else:
-                extract_sentences = self.extract_factual_info_rag(question,all_retrieved_snippets)
-                extract_sentences = str(extract_sentences)
-                # print(extract_answers)
-            half_k = k // 2
-            quarter_k = k // 4
-            all_retrieved_snippets = []
-            all_scores = []
-            # GAR
-            possible_answers = self.generate_possible_answer(question)
-            print(possible_answers)
-            retrieved_snippets, scores = self.retrieval_system.retrieve(question+possible_answers, k=half_k, rrf_k=rrf_k)
-            all_retrieved_snippets.extend(retrieved_snippets)  
-            
-            possible_content = self.generate_possible_content(question)
-            print(possible_content)
-            retrieved_snippets, scores = self.retrieval_system.retrieve(possible_content+question, k=quarter_k, rrf_k=rrf_k)
-            all_retrieved_snippets.extend(retrieved_snippets)  
-            all_scores.extend(scores)
-            
-            possible_title = self.generate_possible_title(question)
-            print(possible_title)
-            retrieved_snippets, scores = self.retrieval_system.retrieve(possible_title+question, k=quarter_k, rrf_k=rrf_k)
-            all_retrieved_snippets.extend(retrieved_snippets)  
-            all_scores.extend(scores)
-        
-        contexts = ["Document [{:d}] (Title: {:s}) {:s}".format(idx, retrieved_snippets[idx]["title"], retrieved_snippets[idx]["content"]) for idx in range(len(retrieved_snippets))]
-        if len(contexts) == 0:
-            contexts = [""]
-        if "openai" in self.llm_name.lower():
-            contexts = [self.tokenizer.decode(self.tokenizer.encode("\n".join(contexts))[:self.context_length])]
-        elif "gemini" in self.llm_name.lower():
-            contexts = [self.tokenizer.decode(self.tokenizer.encode("\n".join(contexts))[:self.context_length])]
-        else:
-            contexts = [self.tokenizer.decode(self.tokenizer.encode("\n".join(contexts), add_special_tokens=False)[:self.context_length])]
 
-        # generate answers
-        answers = []
-        for context in contexts:
-            prompt_medrag = self.templates["medrag_prompt"].render(context=context, question=question, options=options)
-            messages=[
-                    {"role": "system", "content": self.templates["medrag_system"]},
-                    {"role": "user", "content": prompt_medrag}
+        for _ in range(self.iterative_rounds):
+            _, other_sentences, _ = self.split_sentences(question)
+            extracted_facts = ""
+            if other_sentences != "" and retrieved_snippets:
+                extracted_facts = self._join_query_parts(*self.extract_factual_info_rag(question, retrieved_snippets))
+            query_seed = self._join_query_parts(question, extracted_facts)
+
+            possible_answers = self.generate_possible_answer(query_seed)
+            possible_content = self.generate_possible_content(query_seed)
+            possible_title = self.generate_possible_title(query_seed)
+
+            queries = [
+                self._join_query_parts(query_seed, option_text, possible_answers),
+                self._join_query_parts(query_seed, possible_content),
+                self._join_query_parts(query_seed, possible_title),
             ]
-            ans = self.generate(messages)
-            print(ans)
-            messages.append({"role": "assistant", "content": ans})
-            messages.append({"role": "user", "content": "Options:\n"+options+"\n Output the answer in JSON: {'answer': your_answer (A/B/C/D)}"})
-            ans = self.generate(messages)
-            print(ans)  
-            answers.append(re.sub("\s+", " ", ans))
-        
-        return answers[0] if len(answers)==1 else answers, retrieved_snippets, scores
+            budgets = self._split_budget(k, len(queries))
+            retrieved_snippets, scores = self._run_multi_query_retrieval(queries, budgets, rrf_k=rrf_k)
+            if not retrieved_snippets:
+                retrieved_snippets, scores = self.retrieval_system.retrieve(query_seed or question, k=k, rrf_k=rrf_k)
+
+        return retrieved_snippets, scores
+
+    def i_medrag_answer(self, question, options=None, k=32, rrf_k=100, save_path=None, n_rounds=None, n_queries=None, qa_cache_path=None, **kwargs):
+        if n_rounds is None:
+            n_rounds = self.follow_up_rounds
+        if n_queries is None:
+            n_queries = self.follow_up_queries
+        n_rounds = max(1, int(n_rounds))
+        n_queries = max(1, int(n_queries))
+
+        if options is not None:
+            options = '\n'.join([key+". "+options[key] for key in sorted(options.keys())])
+        else:
+            options = ''
+        question_prompt = f"Here is the question:\n{question}\n\n{options}"
+        real_question = f"here is the question: \n{question}"
+        context = ""
+        qa_cache = []
+        if qa_cache_path is not None and os.path.exists(qa_cache_path):
+            with open(qa_cache_path, 'r', encoding='utf-8') as f:
+                parsed_cache = self._safe_parse_list(f.read())
+            if parsed_cache is not None:
+                qa_cache = parsed_cache[:n_rounds]
+                if len(qa_cache) > 0:
+                    context = qa_cache[-1]
+                n_rounds = n_rounds - len(qa_cache)
+        last_context = None
+
+        max_iterations = n_rounds + 3
+        saved_messages = [{"role": "system", "content": self.templates["i_medrag_system"]}]
+
+        for i in range(max_iterations):
+            if i < n_rounds:
+                if context == "":
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": self.templates["i_medrag_system"],
+                        },
+                        {
+                            "role": "user",
+                            "content": f"{real_question}\n\n{self.templates['follow_up_ask'].format(n_queries)}",
+                        },
+                    ]
+                else:
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": self.templates["i_medrag_system"],
+                        },
+                        {
+                            "role": "user",
+                            "content": f"{context}\n\n{real_question}\n\n{self.templates['follow_up_ask'].format(n_queries)}",
+                        },
+                    ]
+            elif context != last_context:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": self.templates["i_medrag_system"],
+                    },
+                    {
+                        "role": "user",
+                        "content": f"{context}\n\n{real_question}\n\n{self.templates['follow_up_answer']}",
+                    },
+                ]
+            elif len(messages) == 1:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": self.templates["i_medrag_system"],
+                    },
+                    {
+                        "role": "user",
+                        "content": f"{context}\n\n{real_question}\n\n{self.templates['follow_up_answer']}",
+                    },
+                ]
+            saved_messages.append(messages[-1])
+            if save_path:
+                with open(save_path, 'w') as f:
+                    json.dump([p if type(p) == dict else p.model_dump() for p in saved_messages], f, indent=4)
+            last_context = context
+            last_content = self.generate(messages, **kwargs)
+            response_message = {"role": "assistant", "content": last_content}
+            saved_messages.append(response_message)
+            if save_path:
+                with open(save_path, 'w') as f:
+                    json.dump([p if type(p) == dict else p.model_dump() for p in saved_messages], f, indent=4)
+            if i >= n_rounds and ("## Answer" in last_content or "answer is" in last_content.lower()):
+                messages.append(response_message)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Options:\n"+options+"\n Output the answer in JSON: {'answer': your_answer (A/B/C/D)}" if options else "Output the answer in JSON: {'answer': your_answer}",
+                    }
+                )
+                saved_messages.append(messages[-1])
+                answer_content = self.generate(messages, **kwargs)
+                answer_message = {"role": "assistant", "content": answer_content}
+                messages.append(answer_message)
+                saved_messages.append(messages[-1])
+                if save_path:
+                    with open(save_path, 'w') as f:
+                        json.dump([p if type(p) == dict else p.model_dump() for p in saved_messages], f, indent=4)
+                return messages[-1]["content"], messages
+            elif "## Queries" in last_content:
+                messages = messages[:-1]
+                if last_content.split("## Queries")[-1].strip() == "":
+                    print("Empty queries. Continue with next iteration.")
+                    continue
+                try:
+                    action_str = self.generate([
+                        {
+                            "role": "user",
+                            "content": f"Parse the following passage and extract the queries as a list: {last_content}.\n\nPresent the queries as they are. DO NOT merge or break down queries. Output the list of queries in JSON format: {{\"output\": [\"query 1\", ..., \"query N\"]}}",
+                        }
+                    ], **kwargs)
+                    action_str = re.search(r"output\": (\[.*\])", action_str, re.DOTALL).group(1)
+                    parsed_actions = self._safe_parse_list(action_str)
+                    if parsed_actions is None:
+                        raise ValueError("Failed to parse extracted query list.")
+                    action_list = [re.sub(r'^\d+\.\s*', '', str(s).strip()) for s in parsed_actions]
+                except Exception as E:
+                    print("Error parsing action list. Continue with next iteration.")
+                    error_class = E.__class__.__name__
+                    error = f"{error_class}: {str(E)}"
+                    print(error)
+                    if save_path:
+                        with open(save_path + ".error", 'a') as f:
+                            f.write(f"{error}\n")
+                    continue
+                for query in action_list:
+                    if query.strip() == "":
+                        continue
+                    try:
+                        rag_result = self.medrag_answer(query, k=k, rrf_k=rrf_k, **kwargs)[0]
+                        context += f"\n\nQuery: {query}\nAnswer: {rag_result}"
+                        context = context.strip()
+                    except Exception as E:
+                        error_class = E.__class__.__name__
+                        error = f"{error_class}: {str(E)}"
+                        print(error)
+                        if save_path:
+                            with open(save_path + ".error", 'a') as f:
+                                f.write(f"{error}\n")
+                qa_cache.append(context)
+                if qa_cache_path:
+                    with open(qa_cache_path, 'w') as f:
+                        json.dump(qa_cache, f, indent=4)
+            else:
+                messages.append(response_message)
+                print("No queries or answer. Continue with next iteration.")
+                continue
+        return messages[-1]["content"], messages
+
     def medrag_answer(self, question, options=None, k=32, rrf_k=100, save_dir = None, snippets=None, snippets_ids=None, **kwargs):
         '''
         question (str): question to be answered
@@ -479,10 +705,7 @@ class RGAR:
         '''
         
         copy_options = options
-        if options is not None:
-            options = '\n'.join([key+". "+options[key] for key in sorted(options.keys())])
-        else:
-            options = ''
+        options = self._format_options(options)
 
         # retrieve relevant snippets
         if self.rag:
@@ -496,25 +719,9 @@ class RGAR:
                 scores = []
             else:
                 assert self.retrieval_system is not None
-                # No transform for the question
-                if self.me==0:
-                    retrieved_snippets, scores = self.retrieval_system.retrieve(question, k=k, rrf_k=rrf_k)
-                # transform the question by GAR, can be seen as round 0
-                elif self.me==1:
-                    retrieved_snippets,scores = self.retrieve_me_GAR_original(question,copy_options,k,rrf_k)
-                # transform the question by RGAR, easy implementation for round 1
-                elif self.me==2:
-                    retrieved_snippets,scores = self.retrieve_me_GAR_original_pro(question,copy_options,k,rrf_k)
-
-            contexts = ["Document [{:d}] (Title: {:s}) {:s}".format(idx, retrieved_snippets[idx]["title"], retrieved_snippets[idx]["content"]) for idx in range(len(retrieved_snippets))]
-            if len(contexts) == 0:
-                contexts = [""]
-            if "openai" in self.llm_name.lower():
-                contexts = [self.tokenizer.decode(self.tokenizer.encode("\n".join(contexts))[:self.context_length])]
-            elif "gemini" in self.llm_name.lower():
-                contexts = [self.tokenizer.decode(self.tokenizer.encode("\n".join(contexts))[:self.context_length])]
-            else:
-                contexts = [self.tokenizer.decode(self.tokenizer.encode("\n".join(contexts), add_special_tokens=False)[:self.context_length])]
+                retrieval_strategy = self._select_retrieval_strategy()
+                retrieved_snippets, scores = retrieval_strategy(question, copy_options, k, rrf_k)
+            contexts = self._build_contexts(retrieved_snippets)
         else:
             retrieved_snippets = []
             scores = []
@@ -541,7 +748,6 @@ class RGAR:
                         {"role": "user", "content": prompt_medrag}
                 ]
                 ans = self.generate(messages)
-                print(ans)
                 answers.append(re.sub("\s+", " ", ans))
         
         if save_dir is not None:

@@ -212,7 +212,7 @@ class Retriever:
             hits = self.index.search(question[0], k=k)
             res_[0].append(np.array([h.score for h in hits]))
             ids = [h.docid for h in hits]
-            indices = [{"source": '_'.join(h.docid.split('_')[:-1]), "index": eval(h.docid.split('_')[-1])} for h in hits]
+            indices = [{"source": '_'.join(h.docid.split('_')[:-1]), "index": int(h.docid.split('_')[-1])} for h in hits]
         else:
             with torch.no_grad():
                 query_embed = self.embedding_function.encode(question, **kwarg)
